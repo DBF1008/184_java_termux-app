@@ -105,6 +105,12 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
     /** If the user has executed the {@link TERMUX_SERVICE#ACTION_STOP_SERVICE} intent. */
     boolean mWantsToStop = false;
 
+    /** If the service has begun shutting down via {@link #requestStopService()} and is leaving its
+     * foreground state. Used to avoid re-posting the foreground notification after it has been removed,
+     * which would otherwise leave behind an incorrect/leftover notification. Reset whenever the service
+     * (re)enters foreground in {@link #runStartForeground()}. */
+    private boolean mIsStoppingService = false;
+
     private static final String LOG_TAG = "TermuxService";
 
     @Override
@@ -202,6 +208,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
     /** Make service run in foreground mode. */
     private void runStartForeground() {
+        // The service is (re)entering foreground, so it is no longer in the process of stopping. This
+        // also covers the case where a new intent restarts the service after a previous stopSelf().
+        mIsStoppingService = false;
         setupNotificationChannel();
         startForeground(TermuxConstants.TERMUX_APP_NOTIFICATION_ID, buildNotification());
     }
@@ -214,6 +223,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
     /** Request to stop service. */
     private void requestStopService() {
         Logger.logDebug(LOG_TAG, "Requesting to stop service");
+        // Mark the service as stopping before leaving foreground so that any later updateNotification()
+        // call does not re-post the notification after it has been removed.
+        mIsStoppingService = true;
         runStopForeground();
         stopSelf();
     }
@@ -413,15 +425,47 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         // Add the execution command to pending plugin execution commands list
         mShellManager.mPendingPluginExecutionCommands.add(executionCommand);
 
-        if (Runner.APP_SHELL.equalsRunner(executionCommand.runner))
-            executeTermuxTaskCommand(executionCommand);
-        else if (Runner.TERMINAL_SESSION.equalsRunner(executionCommand.runner))
-            executeTermuxSessionCommand(executionCommand);
-        else {
-            String errmsg = getString(R.string.error_termux_service_unsupported_execution_command_runner, executionCommand.runner);
-            executionCommand.setStateFailed(Errno.ERRNO_FAILED.getCode(), errmsg);
-            TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, false);
+        try {
+            if (Runner.APP_SHELL.equalsRunner(executionCommand.runner))
+                executeTermuxTaskCommand(executionCommand);
+            else if (Runner.TERMINAL_SESSION.equalsRunner(executionCommand.runner))
+                executeTermuxSessionCommand(executionCommand);
+            else {
+                String errmsg = getString(R.string.error_termux_service_unsupported_execution_command_runner, executionCommand.runner);
+                executionCommand.setStateFailed(Errno.ERRNO_FAILED.getCode(), errmsg);
+                TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, false);
+            }
+        } finally {
+            // Ensure the command always leaves the pending list once it has been resolved. On the
+            // success path it is already removed after being added to the sessions/tasks list by
+            // createTermuxSession()/createTermuxTask(), so this is a no-op then. For every other
+            // outcome (creation failure, reuse of an existing shell, or an unsupported runner) the
+            // command is still pending here and is removed so that the service is not left holding a
+            // command that will never be resolved and so its result is not processed again during
+            // teardown. The foreground state is then re-evaluated so the service can shut down once
+            // nothing remains.
+            removePendingPluginExecutionCommandAndUpdateNotification(executionCommand);
         }
+    }
+
+    /**
+     * Remove a plugin {@link ExecutionCommand} from the
+     * {@link TermuxShellManager#mPendingPluginExecutionCommands} list if it is still present, and
+     * re-evaluate the foreground service state via {@link #updateNotification()}.
+     *
+     * <p>This is only effective (and only triggers a notification update) when the command was still
+     * pending, i.e. it was not resolved into a foreground {@link TermuxSession} or background
+     * {@link AppShell} (those paths already remove it from the pending list themselves). It is the
+     * single cleanup point for the failure, shell-reuse and unsupported-runner outcomes.
+     *
+     * @param executionCommand The {@link ExecutionCommand} to remove.
+     */
+    private synchronized void removePendingPluginExecutionCommandAndUpdateNotification(ExecutionCommand executionCommand) {
+        if (executionCommand == null || !executionCommand.isPluginExecutionCommand)
+            return;
+
+        if (mShellManager.mPendingPluginExecutionCommands.remove(executionCommand))
+            updateNotification();
     }
 
 
@@ -850,8 +894,20 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
     /** Update the shown foreground service notification after making any changes that affect it. */
     private synchronized void updateNotification() {
-        if (mWakeLock == null && mShellManager.mTermuxSessions.isEmpty() && mShellManager.mTermuxTasks.isEmpty()) {
-            // Exit if we are updating after the user disabled all locks with no sessions or tasks running.
+        // If the service has already begun shutting down and left its foreground state, then do not
+        // perform any further notification work. Re-posting the notification here would leave behind
+        // an incorrect/leftover notification after the service has stopped, and re-requesting a stop
+        // would be redundant. The flag is reset in runStartForeground() if the service re-enters
+        // foreground because of a new start intent.
+        if (mIsStoppingService)
+            return;
+
+        if (mWakeLock == null && mShellManager.mTermuxSessions.isEmpty() && mShellManager.mTermuxTasks.isEmpty()
+                && mShellManager.mPendingPluginExecutionCommands.isEmpty()) {
+            // Exit if we are updating after the user disabled all locks with no sessions or tasks
+            // running and no plugin execution commands are still pending. The pending list is checked
+            // so that the service is not torn down while a plugin command is still being set up and is
+            // awaiting its result, which would otherwise drop that command before it can be processed.
             requestStopService();
         } else {
             ((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE)).notify(TermuxConstants.TERMUX_APP_NOTIFICATION_ID, buildNotification());
