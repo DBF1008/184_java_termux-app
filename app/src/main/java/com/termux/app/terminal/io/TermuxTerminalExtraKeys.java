@@ -77,6 +77,19 @@ public class TermuxTerminalExtraKeys extends TerminalExtraKeys {
         }
     }
 
+    /**
+     * Recompute {@link #mExtraKeysInfo} from the current {@link TermuxActivity#getProperties()}.
+     * <p>
+     * This must be called after the properties have been reloaded from disk (e.g. by
+     * {@code termux-reload-settings}) so that a subsequent {@link #getExtraKeysInfo()} reflects the
+     * latest {@code extra-keys} and {@code extra-keys-style} values. Without this, the toolbar key
+     * matrix and the toolbar height (which is derived from the matrix row count) would keep using
+     * the stale value computed in the constructor.
+     */
+    public void reloadExtraKeysInfo() {
+        setExtraKeys();
+    }
+
     public ExtraKeysInfo getExtraKeysInfo() {
         return mExtraKeysInfo;
     }

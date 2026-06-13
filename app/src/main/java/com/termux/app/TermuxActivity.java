@@ -525,6 +525,20 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
         terminalToolbarViewPager.setAdapter(new TerminalToolbarViewPager.PageAdapter(this, savedTextInput));
         terminalToolbarViewPager.addOnPageChangeListener(new TerminalToolbarViewPager.OnPageChangeListener(this, terminalToolbarViewPager));
+
+        // After an activity recreate (e.g. a style switch or night mode change) the toolbar text
+        // input page and its typed content are restored, but focus is not, so the user can be
+        // silently dropped out of the input box. Once the view pager has restored its selected page,
+        // re-focus the text input if it is the active page so the input state stays consistent.
+        if (mIsActivityRecreated) {
+            terminalToolbarViewPager.post(() -> {
+                if (terminalToolbarViewPager.getVisibility() == View.VISIBLE
+                        && isTerminalToolbarTextInputViewSelected()) {
+                    final View textInputView = findViewById(R.id.terminal_toolbar_text_input);
+                    if (textInputView != null) textInputView.requestFocus();
+                }
+            });
+        }
     }
 
     private void setTerminalToolbarHeight() {
@@ -532,9 +546,10 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         if (terminalToolbarViewPager == null) return;
 
         ViewGroup.LayoutParams layoutParams = terminalToolbarViewPager.getLayoutParams();
-        layoutParams.height = Math.round(mTerminalToolbarDefaultHeight *
-            (mTermuxTerminalExtraKeys.getExtraKeysInfo() == null ? 0 : mTermuxTerminalExtraKeys.getExtraKeysInfo().getMatrix().length) *
-            mProperties.getTerminalToolbarHeightScaleFactor());
+        int matrixRowCount = TerminalToolbarViewPager.getExtraKeysMatrixRowCount(
+            mTermuxTerminalExtraKeys == null ? null : mTermuxTerminalExtraKeys.getExtraKeysInfo());
+        layoutParams.height = TerminalToolbarViewPager.calculateTerminalToolbarHeight(
+            mTerminalToolbarDefaultHeight, matrixRowCount, mProperties.getTerminalToolbarHeightScaleFactor());
         terminalToolbarViewPager.setLayoutParams(layoutParams);
     }
 
@@ -968,6 +983,13 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
     private void reloadActivityStyling(boolean recreateActivity) {
         if (mProperties != null) {
             reloadProperties();
+
+            // Recompute the extra keys matrix from the just-reloaded properties before it is applied
+            // to the toolbar below. Otherwise the stale matrix cached at construction would be reused,
+            // leaving the key layout unrefreshed and the toolbar height (derived from the matrix row
+            // count) wrong after an in-place reload such as termux-reload-settings.
+            if (mTermuxTerminalExtraKeys != null)
+                mTermuxTerminalExtraKeys.reloadExtraKeysInfo();
 
             if (mExtraKeysView != null) {
                 mExtraKeysView.setButtonTextAllCaps(mProperties.shouldExtraKeysTextBeAllCaps());

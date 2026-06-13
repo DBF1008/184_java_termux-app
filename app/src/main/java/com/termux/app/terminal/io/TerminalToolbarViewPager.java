@@ -6,15 +6,43 @@ import android.view.ViewGroup;
 import android.widget.EditText;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.viewpager.widget.PagerAdapter;
 import androidx.viewpager.widget.ViewPager;
 
 import com.termux.R;
 import com.termux.app.TermuxActivity;
+import com.termux.shared.termux.extrakeys.ExtraKeysInfo;
 import com.termux.shared.termux.extrakeys.ExtraKeysView;
 import com.termux.terminal.TerminalSession;
 
 public class TerminalToolbarViewPager {
+
+    /**
+     * Get the number of rows in the extra keys matrix, or {@code 0} if there are no extra keys.
+     * The terminal toolbar shows one row of extra keys per matrix row, so this is the multiplier
+     * used to size the toolbar in {@link #calculateTerminalToolbarHeight(float, int, float)}.
+     */
+    public static int getExtraKeysMatrixRowCount(@Nullable ExtraKeysInfo extraKeysInfo) {
+        if (extraKeysInfo == null || extraKeysInfo.getMatrix() == null)
+            return 0;
+        return extraKeysInfo.getMatrix().length;
+    }
+
+    /**
+     * Calculate the terminal toolbar height in pixels. The height is the per-row default height
+     * times the number of extra keys rows, scaled by the user configured {@code terminal-toolbar-height}
+     * factor. Keeping this as a pure function ensures the height always tracks the <i>current</i>
+     * extra keys matrix instead of a stale cached value after a style switch or settings reload.
+     *
+     * @param defaultHeightPerRowPx The default height of a single extra keys row in pixels.
+     * @param matrixRowCount The number of extra keys rows, see {@link #getExtraKeysMatrixRowCount(ExtraKeysInfo)}.
+     * @param heightScaleFactor The {@code terminal-toolbar-height} scale factor from properties.
+     */
+    public static int calculateTerminalToolbarHeight(float defaultHeightPerRowPx, int matrixRowCount,
+                                                      float heightScaleFactor) {
+        return Math.round(defaultHeightPerRowPx * matrixRowCount * heightScaleFactor);
+    }
 
     public static class PageAdapter extends PagerAdapter {
 
