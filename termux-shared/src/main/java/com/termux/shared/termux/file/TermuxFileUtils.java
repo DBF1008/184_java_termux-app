@@ -343,6 +343,24 @@ public class TermuxFileUtils {
     }
 
     /**
+     * Check if the termux prefix directory contains a valid, complete bootstrap installation.
+     *
+     * A valid prefix is one where the bootstrap ZIP has been fully extracted and symlinks created.
+     * This is determined by checking for the existence of the {@code $PREFIX/bin} directory,
+     * which is always present in a complete installation and is created early during extraction.
+     *
+     * A partially extracted prefix (e.g., only {@code tmp/} or {@code etc/} directories from an
+     * interrupted installation) will be detected as invalid, triggering reinstallation.
+     *
+     * @return Returns {@code true} if the prefix directory exists and contains the {@code bin/}
+     * subdirectory, indicating a complete bootstrap extraction, otherwise {@code false}.
+     */
+    public static boolean isTermuxPrefixDirectoryValid() {
+        return FileUtils.directoryFileExists(TERMUX_PREFIX_DIR_PATH, true)
+            && FileUtils.directoryFileExists(TermuxConstants.TERMUX_BIN_PREFIX_DIR_PATH, true);
+    }
+
+    /**
      * Get a markdown {@link String} for stat output for various Termux app files paths.
      *
      * @param context The context for operations.

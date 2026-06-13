@@ -652,6 +652,12 @@ public final class TermuxConstants {
     public static final File TERMUX_STAGING_PREFIX_DIR = new File(TERMUX_STAGING_PREFIX_DIR_PATH);
 
 
+    /** Termux app usr-trash directory path - used as temporary backup of old prefix during atomic rename */
+    public static final String TERMUX_TRASH_PREFIX_DIR_PATH = TERMUX_FILES_DIR_PATH + "/usr-trash"; // Default: "/data/data/com.termux/files/usr-trash"
+    /** Termux app usr-trash directory */
+    public static final File TERMUX_TRASH_PREFIX_DIR = new File(TERMUX_TRASH_PREFIX_DIR_PATH);
+
+
 
     /** Termux app $HOME directory path */
     public static final String TERMUX_HOME_DIR_PATH = TERMUX_FILES_DIR_PATH + "/home"; // Default: "/data/data/com.termux/files/home"

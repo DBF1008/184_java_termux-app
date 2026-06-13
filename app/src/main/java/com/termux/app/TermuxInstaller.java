@@ -37,6 +37,8 @@ import static com.termux.shared.termux.TermuxConstants.TERMUX_PREFIX_DIR;
 import static com.termux.shared.termux.TermuxConstants.TERMUX_PREFIX_DIR_PATH;
 import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR;
 import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR_PATH;
+import static com.termux.shared.termux.TermuxConstants.TERMUX_TRASH_PREFIX_DIR;
+import static com.termux.shared.termux.TermuxConstants.TERMUX_TRASH_PREFIX_DIR_PATH;
 
 /**
  * Install the Termux bootstrap packages if necessary by following the below steps:
@@ -102,13 +104,17 @@ final class TermuxInstaller {
             return;
         }
 
-        // If prefix directory exists, even if its a symlink to a valid directory and symlink is not broken/dangling
+        // If prefix directory exists and is a valid, complete installation, skip bootstrap
         if (FileUtils.directoryFileExists(TERMUX_PREFIX_DIR_PATH, true)) {
-            if (TermuxFileUtils.isTermuxPrefixDirectoryEmpty()) {
-                Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" exists but is empty or only contains specific unimportant files.");
-            } else {
+            if (TermuxFileUtils.isTermuxPrefixDirectoryValid()) {
+                // Prefix has bin/ directory — bootstrap was fully extracted; just ensure env file
+                // is up-to-date in case it was deleted or became stale (fixes env inconsistency)
+                Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" is valid. Skipping bootstrap installation.");
+                TermuxShellEnvironment.writeEnvironmentToFile(activity);
                 whenDone.run();
                 return;
+            } else {
+                Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" exists but does not contain a valid installation (missing bin/ directory). Will attempt to reinstall.");
             }
         } else if (FileUtils.fileExists(TERMUX_PREFIX_DIR_PATH, false)) {
             Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" does not exist but another file exists at its destination.");
@@ -130,11 +136,25 @@ final class TermuxInstaller {
                         return;
                     }
 
-                    // Delete prefix directory or any file at its destination
-                    error = FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
+                    // Delete any leftover trash directory from a prior failed install
+                    error = FileUtils.deleteFile("termux prefix trash directory", TERMUX_TRASH_PREFIX_DIR_PATH, true);
                     if (error != null) {
                         showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
                         return;
+                    }
+
+                    // Move existing prefix to trash as a backup instead of deleting it outright.
+                    // This ensures that if the subsequent staging→prefix rename fails, we can
+                    // restore the old prefix from trash, preventing total data loss.
+                    if (FileUtils.directoryFileExists(TERMUX_PREFIX_DIR_PATH, true)) {
+                        if (!TERMUX_PREFIX_DIR.renameTo(TERMUX_TRASH_PREFIX_DIR)) {
+                            // Fallback: if rename fails (e.g. target already exists), delete prefix directly
+                            error = FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
+                            if (error != null) {
+                                showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
+                                return;
+                            }
+                        }
                     }
 
                     // Create prefix staging directory if it does not already exist and set required permissions
@@ -144,12 +164,10 @@ final class TermuxInstaller {
                         return;
                     }
 
-                    // Create prefix directory if it does not already exist and set required permissions
-                    error = TermuxFileUtils.isTermuxPrefixDirectoryAccessible(true, true);
-                    if (error != null) {
-                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                        return;
-                    }
+                    // Note: We do NOT create the prefix directory here. The old prefix was moved to trash above,
+                    // so the prefix path should be free. The staging directory will be renamed to the prefix path
+                    // after successful extraction. Creating the prefix directory now would cause the renameTo()
+                    // call to fail on many Android versions (target already exists).
 
                     Logger.logInfo(LOG_TAG, "Extracting bootstrap zip to prefix staging directory \"" + TERMUX_STAGING_PREFIX_DIR_PATH + "\".");
 
@@ -213,8 +231,20 @@ final class TermuxInstaller {
                     Logger.logInfo(LOG_TAG, "Moving termux prefix staging to prefix directory.");
 
                     if (!TERMUX_STAGING_PREFIX_DIR.renameTo(TERMUX_PREFIX_DIR)) {
+                        // Rename failed — attempt to restore old prefix from trash backup
+                        if (FileUtils.directoryFileExists(TERMUX_TRASH_PREFIX_DIR_PATH, true)) {
+                            boolean restored = TERMUX_TRASH_PREFIX_DIR.renameTo(TERMUX_PREFIX_DIR);
+                            if (restored) {
+                                Logger.logInfo(LOG_TAG, "Restored old prefix from trash after staging rename failure.");
+                            } else {
+                                Logger.logError(LOG_TAG, "CRITICAL: Failed to restore prefix from trash after staging rename failure.");
+                            }
+                        }
                         throw new RuntimeException("Moving termux prefix staging to prefix directory failed");
                     }
+
+                    // Successfully moved staging to prefix — clean up trash backup
+                    FileUtils.deleteFile("termux prefix trash directory", TERMUX_TRASH_PREFIX_DIR_PATH, true);
 
                     Logger.logInfo(LOG_TAG, "Bootstrap packages installed successfully.");
 
@@ -254,7 +284,11 @@ final class TermuxInstaller {
                     })
                     .setPositiveButton(R.string.bootstrap_error_try_again, (dialog, which) -> {
                         dialog.dismiss();
+                        // Clean up all installation artifacts before retrying:
+                        // staging (partial extraction), prefix (incomplete/old), and trash (backup from rename)
+                        FileUtils.deleteFile("termux prefix staging directory", TERMUX_STAGING_PREFIX_DIR_PATH, true);
                         FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
+                        FileUtils.deleteFile("termux prefix trash directory", TERMUX_TRASH_PREFIX_DIR_PATH, true);
                         TermuxInstaller.setupBootstrapIfNeeded(activity, whenDone);
                     }).show();
             } catch (WindowManager.BadTokenException e1) {
