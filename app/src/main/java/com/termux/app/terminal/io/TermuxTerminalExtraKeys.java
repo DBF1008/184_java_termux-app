@@ -81,6 +81,19 @@ public class TermuxTerminalExtraKeys extends TerminalExtraKeys {
         return mExtraKeysInfo;
     }
 
+    /**
+     * Reload the extra keys configuration from properties. Should be called after
+     * properties are reloaded from disk (e.g. via {@code termux-reload-settings})
+     * to refresh the cached {@link ExtraKeysInfo}.
+     *
+     * Without this call, consumers of {@link #getExtraKeysInfo()} will continue
+     * to receive the stale object created at construction time, causing the
+     * toolbar button matrix and height to be out of sync with the on-disk config.
+     */
+    public void reload() {
+        setExtraKeys();
+    }
+
     @SuppressLint("RtlHardcoded")
     @Override
     public void onTerminalExtraKeyButtonClick(View view, String key, boolean ctrlDown, boolean altDown, boolean shiftDown, boolean fnDown) {

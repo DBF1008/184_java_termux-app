@@ -52,6 +52,7 @@ import java.util.List;
 import java.util.Map;
 
 import androidx.drawerlayout.widget.DrawerLayout;
+import androidx.viewpager.widget.ViewPager;
 
 public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
@@ -146,6 +147,22 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     public void onReloadActivityStyling() {
         // Show the soft keyboard if required
         setSoftKeyboardState(false, true);
+
+        // Restore focus to the view that should have it after the reload.
+        // setSoftKeyboardState(false, true) skips the final requestFocus() /
+        // delayed-show branch to avoid force-popping the keyboard when a
+        // hardware keyboard is connected.  However the OnFocusChangeListener it
+        // installs *will* show/hide the keyboard automatically when focus
+        // changes, so explicitly restoring focus here is sufficient to bring
+        // the keyboard back if it was visible before the reload.
+        ViewPager viewPager = mActivity.getTerminalToolbarViewPager();
+        if (viewPager != null && viewPager.getVisibility() == View.VISIBLE
+                && mActivity.isTerminalToolbarTextInputViewSelected()) {
+            EditText textInput = mActivity.findViewById(R.id.terminal_toolbar_text_input);
+            if (textInput != null) textInput.requestFocus();
+        } else {
+            mActivity.getTerminalView().requestFocus();
+        }
 
         // Start terminal cursor blinking if enabled
         setTerminalCursorBlinkerState(true);

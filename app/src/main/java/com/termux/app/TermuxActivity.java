@@ -527,13 +527,30 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         terminalToolbarViewPager.addOnPageChangeListener(new TerminalToolbarViewPager.OnPageChangeListener(this, terminalToolbarViewPager));
     }
 
+    /**
+     * Calculate the toolbar height in pixels based on the default per-row height,
+     * the number of extra-key matrix rows, and the user-configured scale factor.
+     * <p>
+     * Extracted as a {@code static} method so it can be unit-tested without the
+     * Android framework.
+     *
+     * @param defaultHeight The base height of a single row from the layout XML (px).
+     * @param numberOfRows  The number of rows in the extra-key matrix (may be 0).
+     * @param scaleFactor   The user-configured scale factor (clamped to [0.4, 3.0]).
+     * @return The computed toolbar height in pixels.
+     */
+    static int calculateToolbarHeight(int defaultHeight, int numberOfRows, float scaleFactor) {
+        return Math.round(defaultHeight * numberOfRows * scaleFactor);
+    }
+
     private void setTerminalToolbarHeight() {
         final ViewPager terminalToolbarViewPager = getTerminalToolbarViewPager();
         if (terminalToolbarViewPager == null) return;
 
+        int numberOfRows = (mTermuxTerminalExtraKeys.getExtraKeysInfo() == null) ? 0
+            : mTermuxTerminalExtraKeys.getExtraKeysInfo().getMatrix().length;
         ViewGroup.LayoutParams layoutParams = terminalToolbarViewPager.getLayoutParams();
-        layoutParams.height = Math.round(mTerminalToolbarDefaultHeight *
-            (mTermuxTerminalExtraKeys.getExtraKeysInfo() == null ? 0 : mTermuxTerminalExtraKeys.getExtraKeysInfo().getMatrix().length) *
+        layoutParams.height = calculateToolbarHeight(mTerminalToolbarDefaultHeight, numberOfRows,
             mProperties.getTerminalToolbarHeightScaleFactor());
         terminalToolbarViewPager.setLayoutParams(layoutParams);
     }
@@ -558,6 +575,38 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         if (textInputView != null) {
             String textInput = textInputView.getText().toString();
             if (!textInput.isEmpty()) savedInstanceState.putString(ARG_TERMINAL_TOOLBAR_TEXT_INPUT, textInput);
+        }
+    }
+
+    /**
+     * Retrieve the current text from the toolbar text-input {@link EditText},
+     * or {@code null} if the view does not exist or the field is empty.
+     * <p>
+     * Used to snapshot user input before a non-recreate reload so that it can
+     * be restored afterwards — {@link #saveTerminalToolbarTextInput(Bundle)}
+     * only covers the full activity-recreation path.
+     */
+    private String getTerminalToolbarTextInputText() {
+        final EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+        if (textInputView != null) {
+            String text = textInputView.getText().toString();
+            return text.isEmpty() ? null : text;
+        }
+        return null;
+    }
+
+    /**
+     * Restore previously saved text into the toolbar text-input {@link EditText}.
+     * Places the cursor at the end of the restored text.
+     *
+     * @param text The text to restore; {@code null} or empty is a no-op.
+     */
+    private void restoreTerminalToolbarTextInput(String text) {
+        if (text == null || text.isEmpty()) return;
+        final EditText textInputView = findViewById(R.id.terminal_toolbar_text_input);
+        if (textInputView != null) {
+            textInputView.setText(text);
+            textInputView.setSelection(text.length());
         }
     }
 
@@ -969,9 +1018,25 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         if (mProperties != null) {
             reloadProperties();
 
+            // Re-parse the extra-keys configuration from the freshly loaded
+            // properties so that getExtraKeysInfo() returns up-to-date data.
+            // Without this the toolbar button matrix and height calculation
+            // below would use stale values from construction time.
+            if (mTermuxTerminalExtraKeys != null)
+                mTermuxTerminalExtraKeys.reload();
+
             if (mExtraKeysView != null) {
+                // Snapshot the text-input field before rebuilding the toolbar
+                // views so that user input is not lost during a non-recreate
+                // reload (the ViewPager adapter is *not* recreated here, but
+                // the ExtraKeysView grid is torn down and rebuilt).
+                String savedTextInput = getTerminalToolbarTextInputText();
+
                 mExtraKeysView.setButtonTextAllCaps(mProperties.shouldExtraKeysTextBeAllCaps());
-                mExtraKeysView.reload(mTermuxTerminalExtraKeys.getExtraKeysInfo(), mTerminalToolbarDefaultHeight);
+                mExtraKeysView.reload(mTermuxTerminalExtraKeys.getExtraKeysInfo(),
+                    mTerminalToolbarDefaultHeight);
+
+                restoreTerminalToolbarTextInput(savedTextInput);
             }
 
             // Update NightMode.APP_NIGHT_MODE
