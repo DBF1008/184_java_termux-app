@@ -374,6 +374,33 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
         savedInstanceState.putBoolean(ARG_ACTIVITY_RECREATED, true);
     }
 
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        Logger.logDebug(LOG_TAG, "onNewIntent");
+
+        if (mIsInvalidState || intent == null) return;
+
+        // Update the stored intent so getIntent() returns the latest.
+        setIntent(intent);
+
+        // Handle shortcut intents (e.g., "New session" from launcher shortcuts).
+        // When the activity is already running (singleTask), the shortcut intent is delivered
+        // here instead of onCreate/onServiceConnected.
+        if (Intent.ACTION_RUN.equals(intent.getAction())) {
+            if (mTermuxService != null && mTermuxTerminalSessionActivityClient != null) {
+                boolean isFailSafe = intent.getBooleanExtra(TERMUX_ACTIVITY.EXTRA_FAILSAFE_SESSION, false);
+                mTermuxTerminalSessionActivityClient.addNewSession(isFailSafe, null);
+            }
+            // Clear the action to prevent duplicate session creation if the activity is later recreated.
+            intent.setAction(null);
+        } else {
+            // For any other intent (e.g., from a plugin), re-sync the session highlight
+            // to ensure the UI reflects the actual current session.
+            syncSessionHighlight();
+        }
+    }
+
 
 
 
@@ -857,6 +884,23 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
 
     public void termuxSessionListNotifyUpdated() {
         mTermuxSessionListViewController.notifyDataSetChanged();
+        syncSessionHighlight();
+    }
+
+    /** Re-sync the session list highlight with the actual current session. */
+    public void syncSessionHighlight() {
+        if (mTermuxService == null || mTerminalView == null) return;
+
+        TerminalSession currentSession = mTerminalView.getCurrentSession();
+        if (currentSession == null) return;
+
+        int indexOfSession = mTermuxService.getIndexOfSession(currentSession);
+        if (indexOfSession < 0) return;
+
+        ListView termuxSessionsListView = findViewById(R.id.terminal_sessions_list);
+        if (termuxSessionsListView == null) return;
+
+        termuxSessionsListView.setItemChecked(indexOfSession, true);
     }
 
     public boolean isVisible() {

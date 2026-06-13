@@ -694,6 +694,8 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
             case TERMUX_SERVICE.VALUE_EXTRA_SESSION_ACTION_KEEP_CURRENT_SESSION_AND_OPEN_ACTIVITY:
                 if (getTermuxSessionsSize() == 1)
                     setCurrentStoredTerminalSession(newTerminalSession);
+                else
+                    validateStoredSession();
                 startTermuxActivity();
                 break;
             case TERMUX_SERVICE.VALUE_EXTRA_SESSION_ACTION_SWITCH_TO_NEW_SESSION_AND_DONT_OPEN_ACTIVITY:
@@ -704,6 +706,8 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
             case TERMUX_SERVICE.VALUE_EXTRA_SESSION_ACTION_KEEP_CURRENT_SESSION_AND_DONT_OPEN_ACTIVITY:
                 if (getTermuxSessionsSize() == 1)
                     setCurrentStoredTerminalSession(newTerminalSession);
+                else
+                    validateStoredSession();
                 break;
             default:
                 Logger.logError(LOG_TAG, "Invalid sessionAction: \"" + sessionAction + "\". Force using default sessionAction.");
@@ -868,6 +872,36 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         TermuxAppSharedPreferences preferences = TermuxAppSharedPreferences.build(this);
         if (preferences == null) return;
         preferences.setCurrentSession(terminalSession.mHandle);
+    }
+
+    /**
+     * Ensure the stored session handle still points to a running session.
+     * If the stored session has been removed (e.g., auto-closed after exit), update the
+     * stored handle to the activity's current session or the last running session.
+     */
+    private void validateStoredSession() {
+        TermuxAppSharedPreferences preferences = TermuxAppSharedPreferences.build(this);
+        if (preferences == null) return;
+
+        String storedHandle = preferences.getCurrentSession();
+        if (storedHandle == null) return;
+
+        // Check if the stored handle matches any running session.
+        if (getTerminalSessionForHandle(storedHandle) != null) return;
+
+        // Stored session is stale — update to the activity's current session if available.
+        if (mTermuxTerminalSessionActivityClient != null) {
+            TerminalSession currentSession = mTermuxTerminalSessionActivityClient.getCurrentActivitySession();
+            if (currentSession != null) {
+                preferences.setCurrentSession(currentSession.mHandle);
+                return;
+            }
+        }
+
+        // Fall back to the last running session.
+        TermuxSession lastSession = getLastTermuxSession();
+        if (lastSession != null)
+            preferences.setCurrentSession(lastSession.getTerminalSession().mHandle);
     }
 
     public synchronized boolean isTermuxSessionsEmpty() {

@@ -435,13 +435,16 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         TermuxService service = mActivity.getTermuxService();
         if (service == null) return;
 
-        int index = service.removeTermuxSession(finishedSession);
+        boolean wasCurrentSession = (finishedSession == mActivity.getCurrentSession());
+        int index = service.getIndexOfSession(finishedSession);
+        service.removeTermuxSession(finishedSession);
 
         int size = service.getTermuxSessionsSize();
         if (size == 0) {
             // There are no sessions to show, so finish the activity.
             mActivity.finishActivityIfNotFinishing();
-        } else {
+        } else if (wasCurrentSession) {
+            // The removed session was the one being displayed; switch to an adjacent session.
             if (index >= size) {
                 index = size - 1;
             }
@@ -449,14 +452,22 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
             if (termuxSession != null)
                 setCurrentSession(termuxSession.getTerminalSession());
         }
+        // If a non-current session was removed, the current session is already correct.
+        // termuxSessionListNotifyUpdated() (called from onTermuxSessionExited) will
+        // re-sync the highlight via syncSessionHighlight().
     }
 
     public void termuxSessionListNotifyUpdated() {
         mActivity.termuxSessionListNotifyUpdated();
     }
 
+    /** Returns the terminal session currently displayed by the activity, or null. */
+    @Nullable
+    public TerminalSession getCurrentActivitySession() {
+        return mActivity.getCurrentSession();
+    }
+
     public void checkAndScrollToSession(TerminalSession session) {
-        if (!mActivity.isVisible()) return;
         TermuxService service = mActivity.getTermuxService();
         if (service == null) return;
 
@@ -465,9 +476,15 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         final ListView termuxSessionsListView = mActivity.findViewById(R.id.terminal_sessions_list);
         if (termuxSessionsListView == null) return;
 
+        // Always update the checked state regardless of visibility so that the highlight
+        // is correct when the drawer is next opened.
         termuxSessionsListView.setItemChecked(indexOfSession, true);
-        // Delay is necessary otherwise sometimes scroll to newly added session does not happen
-        termuxSessionsListView.postDelayed(() -> termuxSessionsListView.smoothScrollToPosition(indexOfSession), 1000);
+
+        // Scrolling is only meaningful when the list is visible.
+        if (mActivity.isVisible()) {
+            // Delay is necessary otherwise sometimes scroll to newly added session does not happen
+            termuxSessionsListView.postDelayed(() -> termuxSessionsListView.smoothScrollToPosition(indexOfSession), 1000);
+        }
     }
 
 
