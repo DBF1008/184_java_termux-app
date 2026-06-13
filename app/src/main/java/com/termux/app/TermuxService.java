@@ -368,8 +368,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         executionCommand.isPluginExecutionCommand = true;
 
         // If EXTRA_RUNNER is passed, use that, otherwise check EXTRA_BACKGROUND and default to Runner.TERMINAL_SESSION
-        executionCommand.runner = IntentUtils.getStringExtraIfSet(intent, TERMUX_SERVICE.EXTRA_RUNNER,
-            (intent.getBooleanExtra(TERMUX_SERVICE.EXTRA_BACKGROUND, false) ? Runner.APP_SHELL.getName() : Runner.TERMINAL_SESSION.getName()));
+        executionCommand.runner = Runner.resolveRunner(
+            IntentUtils.getStringExtraIfSet(intent, TERMUX_SERVICE.EXTRA_RUNNER, null),
+            intent.getBooleanExtra(TERMUX_SERVICE.EXTRA_BACKGROUND, false));
         if (Runner.runnerOf(executionCommand.runner) == null) {
             String errmsg = this.getString(R.string.error_termux_service_invalid_execution_command_runner, executionCommand.runner);
             executionCommand.setStateFailed(Errno.ERRNO_FAILED.getCode(), errmsg);
@@ -413,44 +414,88 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         // Add the execution command to pending plugin execution commands list
         mShellManager.mPendingPluginExecutionCommands.add(executionCommand);
 
-        if (Runner.APP_SHELL.equalsRunner(executionCommand.runner))
-            executeTermuxTaskCommand(executionCommand);
-        else if (Runner.TERMINAL_SESSION.equalsRunner(executionCommand.runner))
-            executeTermuxSessionCommand(executionCommand);
-        else {
-            String errmsg = getString(R.string.error_termux_service_unsupported_execution_command_runner, executionCommand.runner);
-            executionCommand.setStateFailed(Errno.ERRNO_FAILED.getCode(), errmsg);
-            TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, false);
-        }
+        // Dispatch to the single consolidated plugin execution path so that foreground TermuxSession
+        // and background TermuxTask commands share identical shell-create-mode handling, existing
+        // shell reuse, session switching and pending/failure cleanup. The runner has already been
+        // validated above to be one of the supported runners.
+        executePluginExecutionCommand(executionCommand);
     }
 
 
 
 
 
-    /** Execute a shell command in background TermuxTask. */
-    private void executeTermuxTaskCommand(ExecutionCommand executionCommand) {
+    /**
+     * Execute a plugin {@link ExecutionCommand} received via {@link TERMUX_SERVICE#ACTION_SERVICE_EXECUTE}
+     * in either a foreground {@link TermuxSession} ({@link Runner#TERMINAL_SESSION}) or a background
+     * {@link AppShell} TermuxTask ({@link Runner#APP_SHELL}).
+     *
+     * This is the single dispatch path for both runners so that shell name derivation,
+     * {@link ShellCreateMode} handling, existing shell reuse, session switching and pending/failure
+     * cleanup behave identically regardless of whether the command runs in the foreground or
+     * background. The {@code executionCommand} must already be a validated plugin command that was
+     * added to {@link TermuxShellManager#mPendingPluginExecutionCommands}; it is removed from that
+     * list on every terminal outcome (shell-create-mode error, existing shell reuse, or
+     * successful/failed creation) so that no pending result is left dangling.
+     */
+    private synchronized void executePluginExecutionCommand(ExecutionCommand executionCommand) {
         if (executionCommand == null) return;
 
-        Logger.logDebug(LOG_TAG, "Executing background \"" + executionCommand.getCommandIdAndLabelLogString() + "\" TermuxTask command");
+        boolean isAppShell = Runner.APP_SHELL.equalsRunner(executionCommand.runner);
+
+        Logger.logDebug(LOG_TAG, "Executing " + (isAppShell ? "background TermuxTask" : "foreground TermuxSession") +
+            " \"" + executionCommand.getCommandIdAndLabelLogString() + "\" command");
 
         // Transform executable path to shell/session name, e.g. "/bin/do-something.sh" => "do-something.sh".
         if (executionCommand.shellName == null && executionCommand.executable != null)
             executionCommand.shellName = ShellUtils.getExecutableBasename(executionCommand.executable);
 
-        AppShell newTermuxTask = null;
         ShellCreateMode shellCreateMode = processShellCreateMode(executionCommand);
-        if (shellCreateMode == null) return;
-        if (ShellCreateMode.NO_SHELL_WITH_NAME.equals(shellCreateMode)) {
-            newTermuxTask = getTermuxTaskForShellName(executionCommand.shellName);
-            if (newTermuxTask != null)
-                Logger.logVerbose(LOG_TAG, "Existing TermuxTask with \"" + executionCommand.shellName + "\" shell name found for shell create mode \"" + shellCreateMode.getMode() + "\"");
-            else
-                Logger.logVerbose(LOG_TAG, "No existing TermuxTask with \"" + executionCommand.shellName + "\" shell name found for shell create mode \"" + shellCreateMode.getMode() + "\"");
+        if (shellCreateMode == null) {
+            // processShellCreateMode() has already set the failed state and processed the error.
+            mShellManager.mPendingPluginExecutionCommands.remove(executionCommand);
+            return;
         }
 
-        if (newTermuxTask == null)
-            newTermuxTask = createTermuxTask(executionCommand);
+        // If a shell with the requested name must be reused instead of created, check for an existing one.
+        if (ShellCreateMode.NO_SHELL_WITH_NAME.equals(shellCreateMode)) {
+            TermuxSession existingTermuxSession = isAppShell ? null : getTermuxSessionForShellName(executionCommand.shellName);
+            AppShell existingTermuxTask = isAppShell ? getTermuxTaskForShellName(executionCommand.shellName) : null;
+            if (existingTermuxSession != null || existingTermuxTask != null) {
+                Logger.logVerbose(LOG_TAG, "Existing " + (isAppShell ? "TermuxTask" : "TermuxSession") + " with \"" +
+                    executionCommand.shellName + "\" shell name found for shell create mode \"" + shellCreateMode.getMode() + "\"");
+
+                // For a foreground command, still switch to/open the existing session even though
+                // the requested command itself is not executed.
+                if (existingTermuxSession != null)
+                    handleSessionAction(DataUtils.getIntFromString(executionCommand.sessionAction,
+                            TERMUX_SERVICE.VALUE_EXTRA_SESSION_ACTION_SWITCH_TO_NEW_SESSION_AND_OPEN_ACTIVITY),
+                        existingTermuxSession.getTerminalSession());
+
+                // The requested command was not executed since a matching shell already exists, so
+                // finish it consistently: report a not-executed error to the caller (via its pending
+                // intent / result directory, or a notification) and remove it from the pending list
+                // so it is not later reported as cancelled.
+                TermuxPluginUtils.setAndProcessPluginExecutionCommandError(this, LOG_TAG, executionCommand, false,
+                    getString(R.string.error_termux_service_execution_command_with_shell_name_already_exists,
+                        executionCommand.shellName, shellCreateMode.getMode()));
+                mShellManager.mPendingPluginExecutionCommands.remove(executionCommand);
+                return;
+            } else {
+                Logger.logVerbose(LOG_TAG, "No existing " + (isAppShell ? "TermuxTask" : "TermuxSession") + " with \"" +
+                    executionCommand.shellName + "\" shell name found for shell create mode \"" + shellCreateMode.getMode() + "\"");
+            }
+        }
+
+        if (isAppShell) {
+            createTermuxTask(executionCommand);
+        } else {
+            TermuxSession newTermuxSession = createTermuxSession(executionCommand);
+            if (newTermuxSession == null) return;
+            handleSessionAction(DataUtils.getIntFromString(executionCommand.sessionAction,
+                    TERMUX_SERVICE.VALUE_EXTRA_SESSION_ACTION_SWITCH_TO_NEW_SESSION_AND_OPEN_ACTIVITY),
+                newTermuxSession.getTerminalSession());
+        }
     }
 
     /** Create a TermuxTask. */
@@ -482,9 +527,12 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         if (newTermuxTask == null) {
             Logger.logError(LOG_TAG, "Failed to execute new TermuxTask command for:\n" + executionCommand.getCommandIdAndLabelLogString());
             // If the execution command was started for a plugin, then process the error
-            if (executionCommand.isPluginExecutionCommand)
+            if (executionCommand.isPluginExecutionCommand) {
                 TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, false);
-            else {
+                // Remove the failed command from the pending plugin execution commands list, consistent
+                // with the success path, so it is not later reported as cancelled.
+                mShellManager.mPendingPluginExecutionCommands.remove(executionCommand);
+            } else {
                 Logger.logError(LOG_TAG, "Set log level to debug or higher to see error in logs");
                 Logger.logErrorPrivateExtended(LOG_TAG, executionCommand.toString());
             }
@@ -527,36 +575,6 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
 
 
-    /** Execute a shell command in a foreground {@link TermuxSession}. */
-    private void executeTermuxSessionCommand(ExecutionCommand executionCommand) {
-        if (executionCommand == null) return;
-
-        Logger.logDebug(LOG_TAG, "Executing foreground \"" + executionCommand.getCommandIdAndLabelLogString() + "\" TermuxSession command");
-
-        // Transform executable path to shell/session name, e.g. "/bin/do-something.sh" => "do-something.sh".
-        if (executionCommand.shellName == null && executionCommand.executable != null)
-            executionCommand.shellName = ShellUtils.getExecutableBasename(executionCommand.executable);
-
-        TermuxSession newTermuxSession = null;
-        ShellCreateMode shellCreateMode = processShellCreateMode(executionCommand);
-        if (shellCreateMode == null) return;
-        if (ShellCreateMode.NO_SHELL_WITH_NAME.equals(shellCreateMode)) {
-            newTermuxSession = getTermuxSessionForShellName(executionCommand.shellName);
-            if (newTermuxSession != null)
-                Logger.logVerbose(LOG_TAG, "Existing TermuxSession with \"" + executionCommand.shellName + "\" shell name found for shell create mode \"" + shellCreateMode.getMode() + "\"");
-            else
-                Logger.logVerbose(LOG_TAG, "No existing TermuxSession with \"" + executionCommand.shellName + "\" shell name found for shell create mode \"" + shellCreateMode.getMode() + "\"");
-        }
-
-        if (newTermuxSession == null)
-            newTermuxSession = createTermuxSession(executionCommand);
-        if (newTermuxSession == null) return;
-
-        handleSessionAction(DataUtils.getIntFromString(executionCommand.sessionAction,
-            TERMUX_SERVICE.VALUE_EXTRA_SESSION_ACTION_SWITCH_TO_NEW_SESSION_AND_OPEN_ACTIVITY),
-            newTermuxSession.getTerminalSession());
-    }
-
     /**
      * Create a {@link TermuxSession}.
      * Currently called by {@link TermuxTerminalSessionActivityClient#addNewSession(boolean, String)} to add a new {@link TermuxSession}.
@@ -596,9 +614,12 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
         if (newTermuxSession == null) {
             Logger.logError(LOG_TAG, "Failed to execute new TermuxSession command for:\n" + executionCommand.getCommandIdAndLabelLogString());
             // If the execution command was started for a plugin, then process the error
-            if (executionCommand.isPluginExecutionCommand)
+            if (executionCommand.isPluginExecutionCommand) {
                 TermuxPluginUtils.processPluginExecutionCommandError(this, LOG_TAG, executionCommand, false);
-            else {
+                // Remove the failed command from the pending plugin execution commands list, consistent
+                // with the success path, so it is not later reported as cancelled.
+                mShellManager.mPendingPluginExecutionCommands.remove(executionCommand);
+            } else {
                 Logger.logError(LOG_TAG, "Set log level to debug or higher to see error in logs");
                 Logger.logErrorPrivateExtended(LOG_TAG, executionCommand.toString());
             }

@@ -111,6 +111,7 @@
     <string name="error_termux_service_unsupported_execution_command_runner">Unsupported execution command runner to TermuxService: `%1$s`</string>
     <string name="error_termux_service_unsupported_execution_command_shell_create_mode">Unsupported execution command shell create mode to TermuxService: `%1$s`</string>
     <string name="error_termux_service_execution_command_shell_name_unset">Shell name not set but `%1$s` shell create mode passed</string>
+    <string name="error_termux_service_execution_command_with_shell_name_already_exists">A shell with name `%1$s` already exists so the command was not executed for `%2$s` shell create mode</string>
 
 
 

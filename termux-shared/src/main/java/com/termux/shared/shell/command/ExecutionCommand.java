@@ -103,6 +103,30 @@ public class ExecutionCommand {
             return runner != null ? runner : def;
         }
 
+        /**
+         * Resolve the runner name to use for an {@link ExecutionCommand} from an explicitly
+         * requested runner name and a background flag.
+         *
+         * If {@code runner} is set (non-{@code null} and non-empty) it is returned as-is so that
+         * the caller can validate it with {@link #runnerOf(String)} and report the exact invalid
+         * value if needed. Otherwise the {@code background} flag selects between {@link #APP_SHELL}
+         * (background) and {@link #TERMINAL_SESSION} (foreground).
+         *
+         * This centralises the runner selection that is shared by the external {@code RUN_COMMAND}
+         * entry point and the internal {@code ACTION_SERVICE_EXECUTE} entry point so that both
+         * resolve the runner identically.
+         *
+         * @param runner The explicitly requested runner name, may be {@code null} or empty.
+         * @param background Whether the command should run in the background if no runner is set.
+         * @return Returns the resolved runner name.
+         */
+        @NonNull
+        public static String resolveRunner(@Nullable String runner, boolean background) {
+            if (runner != null && !runner.isEmpty())
+                return runner;
+            return (background ? APP_SHELL : TERMINAL_SESSION).getName();
+        }
+
     }
 
     public enum ShellCreateMode {
