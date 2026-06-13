@@ -33,9 +33,7 @@ import java.util.List;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
-import static com.termux.shared.termux.TermuxConstants.TERMUX_PREFIX_DIR;
 import static com.termux.shared.termux.TermuxConstants.TERMUX_PREFIX_DIR_PATH;
-import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR;
 import static com.termux.shared.termux.TermuxConstants.TERMUX_STAGING_PREFIX_DIR_PATH;
 
 /**
@@ -102,14 +100,17 @@ final class TermuxInstaller {
             return;
         }
 
-        // If prefix directory exists, even if its a symlink to a valid directory and symlink is not broken/dangling
+        // If a valid prefix directory already exists, even if it is a non-dangling symlink to a valid
+        // directory, assume the installation is correct and be done. This guarantees an already valid
+        // prefix is never wiped on (re)launch. Note that this relies on us not leaving a broken
+        // (half-finished) $PREFIX directory below.
+        if (isExistingPrefixDirectoryValid(TERMUX_PREFIX_DIR_PATH)) {
+            whenDone.run();
+            return;
+        }
+
         if (FileUtils.directoryFileExists(TERMUX_PREFIX_DIR_PATH, true)) {
-            if (TermuxFileUtils.isTermuxPrefixDirectoryEmpty()) {
-                Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" exists but is empty or only contains specific unimportant files.");
-            } else {
-                whenDone.run();
-                return;
-            }
+            Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" exists but is empty or only contains specific unimportant files.");
         } else if (FileUtils.fileExists(TERMUX_PREFIX_DIR_PATH, false)) {
             Logger.logInfo(LOG_TAG, "The termux prefix directory \"" + TERMUX_PREFIX_DIR_PATH + "\" does not exist but another file exists at its destination.");
         }
@@ -123,29 +124,22 @@ final class TermuxInstaller {
 
                     Error error;
 
-                    // Delete prefix staging directory or any file at its destination
-                    error = FileUtils.deleteFile("termux prefix staging directory", TERMUX_STAGING_PREFIX_DIR_PATH, true);
+                    // Delete any leftover prefix staging directory and any partial/broken prefix
+                    // directory (or any other file at their destinations). This is idempotent and
+                    // recovers from a previous extraction or migration that was interrupted, ensuring
+                    // we always start from a clean slate.
+                    error = clearBootstrapStagingAndPrefixDirectories(TERMUX_STAGING_PREFIX_DIR_PATH, TERMUX_PREFIX_DIR_PATH);
                     if (error != null) {
                         showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
                         return;
                     }
 
-                    // Delete prefix directory or any file at its destination
-                    error = FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
-                    if (error != null) {
-                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                        return;
-                    }
-
-                    // Create prefix staging directory if it does not already exist and set required permissions
+                    // Create prefix staging directory if it does not already exist and set required permissions.
+                    // The prefix directory itself is intentionally NOT created here; the fully extracted
+                    // staging directory is atomically moved onto it below by migrateStagingToPrefixDirectory().
+                    // Pre-creating the prefix directory would make that move target an existing directory,
+                    // which is unreliable and was the cause of broken/half-finished prefix installs.
                     error = TermuxFileUtils.isTermuxPrefixStagingDirectoryAccessible(true, true);
-                    if (error != null) {
-                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
-                        return;
-                    }
-
-                    // Create prefix directory if it does not already exist and set required permissions
-                    error = TermuxFileUtils.isTermuxPrefixDirectoryAccessible(true, true);
                     if (error != null) {
                         showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
                         return;
@@ -212,8 +206,13 @@ final class TermuxInstaller {
 
                     Logger.logInfo(LOG_TAG, "Moving termux prefix staging to prefix directory.");
 
-                    if (!TERMUX_STAGING_PREFIX_DIR.renameTo(TERMUX_PREFIX_DIR)) {
-                        throw new RuntimeException("Moving termux prefix staging to prefix directory failed");
+                    // Move the fully populated staging directory onto the prefix directory. This deletes
+                    // any leftover prefix destination first and then renames, so it is reliable and
+                    // idempotent even if a partial prefix directory was left over from a previous attempt.
+                    error = migrateStagingToPrefixDirectory(TERMUX_STAGING_PREFIX_DIR_PATH, TERMUX_PREFIX_DIR_PATH);
+                    if (error != null) {
+                        showBootstrapErrorDialog(activity, whenDone, Error.getErrorMarkdownString(error));
+                        return;
                     }
 
                     Logger.logInfo(LOG_TAG, "Bootstrap packages installed successfully.");
@@ -254,7 +253,10 @@ final class TermuxInstaller {
                     })
                     .setPositiveButton(R.string.bootstrap_error_try_again, (dialog, which) -> {
                         dialog.dismiss();
-                        FileUtils.deleteFile("termux prefix directory", TERMUX_PREFIX_DIR_PATH, true);
+                        // Clear any leftover staging and partial prefix directories so the retry starts
+                        // from a clean slate. setupBootstrapIfNeeded() also does this, but clearing here
+                        // ensures a consistent state even if its early-return paths change.
+                        clearBootstrapStagingAndPrefixDirectories(TERMUX_STAGING_PREFIX_DIR_PATH, TERMUX_PREFIX_DIR_PATH);
                         TermuxInstaller.setupBootstrapIfNeeded(activity, whenDone);
                     }).show();
             } catch (WindowManager.BadTokenException e1) {
@@ -369,6 +371,68 @@ final class TermuxInstaller {
                 }
             }
         }.start();
+    }
+
+    /**
+     * Returns whether a usable bootstrap prefix already exists at {@code prefixDirPath} and must be
+     * preserved.
+     * <p/>
+     * A prefix is considered valid if a directory exists at the path (following a non-dangling
+     * symlink) and it is not empty, ignoring the unimportant files listed in
+     * {@link TermuxConstants#TERMUX_PREFIX_DIR_IGNORED_SUB_FILES_PATHS_TO_CONSIDER_AS_EMPTY}.
+     * This is used to ensure an already valid installation is never wiped when (re)running setup, while
+     * still treating an empty/half-finished prefix left over from an interrupted install as invalid.
+     *
+     * @param prefixDirPath The path to the prefix directory to check.
+     * @return Returns {@code true} if a valid prefix exists, otherwise {@code false}.
+     */
+    static boolean isExistingPrefixDirectoryValid(String prefixDirPath) {
+        if (!FileUtils.directoryFileExists(prefixDirPath, true))
+            return false;
+
+        // validateDirectoryFileEmptyOrOnlyContainsSpecificFiles() returns null if the directory is
+        // empty or only contains unimportant files, in which case the prefix is not a valid install.
+        // Any other (non-null) result, including a non-empty directory, means there is a real install.
+        Error error = FileUtils.validateDirectoryFileEmptyOrOnlyContainsSpecificFiles("termux prefix",
+            prefixDirPath, TermuxConstants.TERMUX_PREFIX_DIR_IGNORED_SUB_FILES_PATHS_TO_CONSIDER_AS_EMPTY, true);
+        return error != null;
+    }
+
+    /**
+     * Idempotently delete any leftover prefix staging directory and any partial prefix directory (or
+     * any other file at their destinations). Safe to call when the directories do not exist.
+     *
+     * @param stagingDirPath The path to the prefix staging directory.
+     * @param prefixDirPath The path to the prefix directory.
+     * @return Returns the first {@code error} encountered, otherwise {@code null}.
+     */
+    static Error clearBootstrapStagingAndPrefixDirectories(String stagingDirPath, String prefixDirPath) {
+        Error error;
+
+        // Delete prefix staging directory or any file at its destination
+        error = FileUtils.deleteFile("termux prefix staging directory", stagingDirPath, true);
+        if (error != null)
+            return error;
+
+        // Delete prefix directory or any file at its destination
+        return FileUtils.deleteFile("termux prefix directory", prefixDirPath, true);
+    }
+
+    /**
+     * Move the fully populated staging directory at {@code stagingDirPath} onto the prefix directory
+     * at {@code prefixDirPath}.
+     * <p/>
+     * {@link FileUtils#moveFile(String, String, String, boolean)} deletes any existing destination of
+     * the same file type before renaming, so this is reliable and idempotent even if a partial prefix
+     * directory was left over from a previously interrupted attempt. In the normal install flow the
+     * prefix destination has already been removed by {@link #clearBootstrapStagingAndPrefixDirectories}.
+     *
+     * @param stagingDirPath The path to the (source) prefix staging directory.
+     * @param prefixDirPath The path to the (destination) prefix directory.
+     * @return Returns the {@code error} if the move was not successful, otherwise {@code null}.
+     */
+    static Error migrateStagingToPrefixDirectory(String stagingDirPath, String prefixDirPath) {
+        return FileUtils.moveFile("termux prefix", stagingDirPath, prefixDirPath, false);
     }
 
     private static Error ensureDirectoryExists(File directory) {

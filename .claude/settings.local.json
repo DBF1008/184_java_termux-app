@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(java -version)",
+      "Bash(echo \"=== ANDROID_HOME=$ANDROID_HOME SDK_ROOT=$ANDROID_SDK_ROOT ===\")"
+    ]
+  }
+}
