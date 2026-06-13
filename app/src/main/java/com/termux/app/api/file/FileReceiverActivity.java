@@ -14,6 +14,7 @@ import com.termux.R;
 import com.termux.shared.android.PackageUtils;
 import com.termux.shared.data.DataUtils;
 import com.termux.shared.data.IntentUtils;
+import com.termux.shared.file.FileUtils;
 import com.termux.shared.net.uri.UriUtils;
 import com.termux.shared.interact.MessageDialogUtils;
 import com.termux.shared.net.uri.UriScheme;
@@ -41,6 +42,12 @@ public class FileReceiverActivity extends AppCompatActivity {
     static final String TERMUX_RECEIVEDIR = TermuxConstants.TERMUX_FILES_DIR_PATH + "/home/downloads";
     static final String EDITOR_PROGRAM = TermuxConstants.TERMUX_HOME_DIR_PATH + "/bin/termux-file-editor";
     static final String URL_OPENER_PROGRAM = TermuxConstants.TERMUX_HOME_DIR_PATH + "/bin/termux-url-opener";
+
+    /** Fallback basename used when no valid name can be derived for a received file or content uri. */
+    static final String DEFAULT_RECEIVED_FILE_BASENAME = "received_file";
+
+    /** Fallback basename used when no valid name can be derived for received shared text. */
+    static final String DEFAULT_RECEIVED_TEXT_FILE_BASENAME = "received_text";
 
     /**
      * If the activity should be finished when the name input dialog is dismissed. This is disabled
@@ -86,8 +93,8 @@ public class FileReceiverActivity extends AppCompatActivity {
                 } else {
                     String subject = IntentUtils.getStringExtraIfSet(intent, Intent.EXTRA_SUBJECT, null);
                     if (subject == null) subject = sharedTitle;
-                    if (subject != null) subject += ".txt";
-                    promptNameAndSave(new ByteArrayInputStream(sharedText.getBytes(StandardCharsets.UTF_8)), subject);
+                    promptNameAndSave(new ByteArrayInputStream(sharedText.getBytes(StandardCharsets.UTF_8)),
+                        getReceivedTextFileName(subject));
                 }
             } else {
                 showErrorDialogAndQuit("Send action without content - nothing to save.");
@@ -115,7 +122,7 @@ public class FileReceiverActivity extends AppCompatActivity {
                 File file = new File(path);
                 try {
                     FileInputStream in = new FileInputStream(file);
-                    promptNameAndSave(in, file.getName());
+                    promptNameAndSave(in, getReceivedFileName(file.getName()));
                 } catch (FileNotFoundException e) {
                     showErrorDialogAndQuit("Cannot open file: " + e.getMessage() + ".");
                 }
@@ -138,18 +145,21 @@ public class FileReceiverActivity extends AppCompatActivity {
         try {
             Logger.logVerbose(LOG_TAG, "uri: \"" + uri + "\", path: \"" + uri.getPath() + "\", fragment: \"" + uri.getFragment() + "\"");
 
-            String attachmentFileName = null;
+            String displayName = null;
 
             String[] projection = new String[]{OpenableColumns.DISPLAY_NAME};
             try (Cursor c = getContentResolver().query(uri, projection, null, null, null)) {
                 if (c != null && c.moveToFirst()) {
                     final int fileNameColumnId = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
-                    if (fileNameColumnId >= 0) attachmentFileName = c.getString(fileNameColumnId);
+                    if (fileNameColumnId >= 0) displayName = c.getString(fileNameColumnId);
                 }
             }
 
-            if (attachmentFileName == null) attachmentFileName = subjectFromIntent;
-            if (attachmentFileName == null) attachmentFileName = UriUtils.getUriFileBasename(uri, true);
+            // Unify the file name source: prefer the provider display name, then the intent title,
+            // then the uri basename, falling back to a default. getReceivedFileName() always returns
+            // a sanitized, path-separator-free basename so the file stays inside the downloads dir.
+            String attachmentFileName = getReceivedFileName(displayName, subjectFromIntent,
+                UriUtils.getUriFileBasename(uri, true));
 
             InputStream in = getContentResolver().openInputStream(uri);
             promptNameAndSave(in, attachmentFileName);
@@ -185,10 +195,11 @@ public class FileReceiverActivity extends AppCompatActivity {
                 finish();
             },
             R.string.action_file_received_open_directory, text -> {
-                if (saveStreamWithName(in, text) == null) return;
+                File outFile = saveStreamWithName(in, text);
+                if (outFile == null) return;
 
                 Intent executeIntent = new Intent(TERMUX_SERVICE.ACTION_SERVICE_EXECUTE);
-                executeIntent.putExtra(TERMUX_SERVICE.EXTRA_WORKDIR, TERMUX_RECEIVEDIR);
+                executeIntent.putExtra(TERMUX_SERVICE.EXTRA_WORKDIR, outFile.getParentFile().getAbsolutePath());
                 executeIntent.setClass(FileReceiverActivity.this, TermuxService.class);
                 startService(executeIntent);
                 finish();
@@ -199,33 +210,136 @@ public class FileReceiverActivity extends AppCompatActivity {
     }
 
     public File saveStreamWithName(InputStream in, String attachmentFileName) {
-        File receiveDir = new File(TERMUX_RECEIVEDIR);
-
-        if (DataUtils.isNullOrEmpty(attachmentFileName)) {
-            showErrorDialogAndQuit("File name cannot be null or empty");
-            return null;
-        }
-
-        if (!receiveDir.isDirectory() && !receiveDir.mkdirs()) {
-            showErrorDialogAndQuit("Cannot create directory: " + receiveDir.getAbsolutePath());
-            return null;
-        }
-
         try {
-            final File outFile = new File(receiveDir, attachmentFileName);
-            try (FileOutputStream f = new FileOutputStream(outFile)) {
-                byte[] buffer = new byte[4096];
-                int readBytes;
-                while ((readBytes = in.read(buffer)) > 0) {
-                    f.write(buffer, 0, readBytes);
-                }
-            }
-            return outFile;
+            return saveStreamToFile(in, new File(TERMUX_RECEIVEDIR), attachmentFileName);
         } catch (IOException e) {
-            showErrorDialogAndQuit("Error saving file:\n\n" + e);
+            showErrorDialogAndQuit("Error saving file:\n\n" + e.getMessage());
             Logger.logStackTraceWithMessage(LOG_TAG, "Error saving file", e);
             return null;
         }
+    }
+
+    /**
+     * Sanitize an arbitrary file name candidate into a safe basename usable inside
+     * {@link #TERMUX_RECEIVEDIR}.
+     *
+     * The candidate may come from untrusted sources such as {@link OpenableColumns#DISPLAY_NAME},
+     * {@link Intent#EXTRA_SUBJECT}, {@link Intent#EXTRA_TITLE}, a {@link Uri} basename or the name
+     * typed by the user. Any of these may contain path separators (which would otherwise let the
+     * file escape the downloads directory) or be empty/whitespace. Only the last path segment is
+     * kept and surrounding whitespace is trimmed.
+     *
+     * @param name The raw file name candidate.
+     * @return Returns a non-empty basename, or {@code null} if the candidate cannot yield a valid one.
+     */
+    static String sanitizeFileName(String name) {
+        if (name == null) return null;
+        // Keep only the last path segment so that a name like "a/b/c.txt" or "../c.txt" cannot escape
+        // the target directory. Both "/" and "\" are treated as separators since display names may
+        // originate from providers using either convention.
+        int lastSeparator = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        String basename = (lastSeparator == -1) ? name : name.substring(lastSeparator + 1);
+        basename = basename.trim();
+        if (basename.isEmpty() || ".".equals(basename) || "..".equals(basename)) return null;
+        return basename;
+    }
+
+    /**
+     * Resolve the file name to use for received shared text, ensuring it ends with a {@code .txt}
+     * extension when the subject has none.
+     *
+     * @param subject The {@link Intent#EXTRA_SUBJECT} or {@link Intent#EXTRA_TITLE} value, if any.
+     * @return Returns a sanitized, non-empty file name.
+     */
+    static String getReceivedTextFileName(String subject) {
+        String fileName = sanitizeFileName(subject);
+        if (fileName == null) fileName = DEFAULT_RECEIVED_TEXT_FILE_BASENAME;
+        if (fileName.indexOf('.') < 0) fileName += ".txt";
+        return fileName;
+    }
+
+    /**
+     * Resolve the file name to use for a received file or content uri by picking the first candidate
+     * that sanitizes to a valid basename, falling back to {@link #DEFAULT_RECEIVED_FILE_BASENAME}.
+     *
+     * @param candidates The ordered file name candidates.
+     * @return Returns a sanitized, non-empty file name.
+     */
+    static String getReceivedFileName(String... candidates) {
+        for (String candidate : candidates) {
+            String fileName = sanitizeFileName(candidate);
+            if (fileName != null) return fileName;
+        }
+        return DEFAULT_RECEIVED_FILE_BASENAME;
+    }
+
+    /**
+     * Save {@code in} into {@code outputDir} using a sanitized {@code rawFileName}, never overwriting
+     * an existing file. If a file with the resolved name already exists, a counter suffix like
+     * " (1)", " (2)", ... is inserted before the extension until a free name is found.
+     *
+     * @param in The {@link InputStream} to read the content from.
+     * @param outputDir The directory to save the file in.
+     * @param rawFileName The (possibly unsafe) file name to use.
+     * @return Returns the {@link File} that was written.
+     * @throws IOException if the name is invalid or the file cannot be created or written.
+     */
+    static File saveStreamToFile(InputStream in, File outputDir, String rawFileName) throws IOException {
+        String fileName = sanitizeFileName(rawFileName);
+        if (fileName == null)
+            throw new IOException("File name cannot be null or empty");
+
+        if (!outputDir.isDirectory() && !outputDir.mkdirs())
+            throw new IOException("Cannot create directory: " + outputDir.getAbsolutePath());
+
+        File outFile = getUniqueFile(outputDir, fileName);
+        try (FileOutputStream f = new FileOutputStream(outFile)) {
+            byte[] buffer = new byte[4096];
+            int readBytes;
+            while ((readBytes = in.read(buffer)) > 0) {
+                f.write(buffer, 0, readBytes);
+            }
+        }
+        return outFile;
+    }
+
+    /**
+     * Atomically reserve a file that does not yet exist in {@code dir} for {@code fileName}. If
+     * {@code fileName} is already taken, a " (n)" counter is inserted before the extension. The
+     * returned file is created (empty) via {@link File#createNewFile()} so that the existence check
+     * and reservation are not subject to a time-of-check/time-of-use race.
+     *
+     * @param dir The directory to create the file in.
+     * @param fileName The desired (already sanitized) file name.
+     * @return Returns the newly created, conflict-free {@link File}.
+     * @throws IOException if no unique file could be created.
+     */
+    static File getUniqueFile(File dir, String fileName) throws IOException {
+        File file = new File(dir, fileName);
+        if (file.createNewFile()) return file;
+
+        String basename = FileUtils.getFileBasenameWithoutExtension(fileName);
+        String extension;
+        if (basename == null || basename.isEmpty()) {
+            // Names like "noext" or dotfiles like ".bashrc": keep the whole name and append the
+            // counter at the end.
+            basename = fileName;
+            extension = "";
+        } else {
+            // Everything after the basename, i.e. the dot and extension (e.g. ".pdf").
+            extension = fileName.substring(basename.length());
+        }
+
+        for (int counter = 1; counter <= 1000; counter++) {
+            file = new File(dir, basename + " (" + counter + ")" + extension);
+            if (file.createNewFile()) return file;
+        }
+
+        // Extremely unlikely fallback to guarantee progress and uniqueness.
+        file = new File(dir, basename + "-" + System.currentTimeMillis() + extension);
+        if (file.createNewFile()) return file;
+
+        throw new IOException("Could not create a unique file for: " + fileName);
     }
 
     void handleUrlAndFinish(final String url) {
