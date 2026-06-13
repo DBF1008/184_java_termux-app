@@ -232,12 +232,9 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
      * will only be done if user manually exited termux or if the session was started by a plugin
      * which **expects** the result back via a pending intent.
      *
-     * For TermuxTasks, only tasks that were started by a plugin which **expects** the result
-     * back via a pending intent will be killed, whether user manually exited Termux or if
-     * onDestroy() was directly called because of unintended shutdown. The processing of results
-     * will always be done for the tasks that are killed. The remaining processes will keep on
-     * running until the termux app process is killed by android, like by OOM, so we let them run
-     * as long as they can.
+     * For TermuxTasks, all tasks will be killed to avoid leaving orphan processes. The processing
+     * of results will be done for tasks started by a plugin which **expects** the result back via
+     * a pending intent. Non-plugin tasks are killed and removed without result processing.
      *
      * Some plugin execution commands may not have been processed and added to mTermuxSessions and
      * mTermuxTasks lists before the service is killed, so we maintain a separate
@@ -258,36 +255,53 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
      * stuck if termux app process gets killed, so for this case reasonable timeout values should
      * be used, like in Tasker for the Termux:Tasker actions.
      *
-     * We make copies of each list since items are removed inside the loop.
+     * This method operates on copies of each list and performs all cleanup (killing processes,
+     * processing plugin results, removing from lists) in a single synchronized pass. This avoids
+     * the double-removal bug where killIfExecuting() triggers the onTermuxSessionExited callback
+     * which removes the session from the list, and then the loop would remove a different session
+     * that shifted into the same index. By clearing the lists once at the end, we also avoid
+     * interference from deferred onAppShellExited callbacks posted via mHandler.
      */
     private synchronized void killAllTermuxExecutionCommands() {
-        boolean processResult;
-
         Logger.logDebug(LOG_TAG, "Killing TermuxSessions=" + mShellManager.mTermuxSessions.size() +
             ", TermuxTasks=" + mShellManager.mTermuxTasks.size() +
             ", PendingPluginExecutionCommands=" + mShellManager.mPendingPluginExecutionCommands.size());
 
+        // Work on copies to avoid interference from callbacks that modify the original lists
+        // (e.g., onTermuxSessionExited called from killIfExecuting → processTermuxSessionResult).
         List<TermuxSession> termuxSessions = new ArrayList<>(mShellManager.mTermuxSessions);
         List<AppShell> termuxTasks = new ArrayList<>(mShellManager.mTermuxTasks);
         List<ExecutionCommand> pendingPluginExecutionCommands = new ArrayList<>(mShellManager.mPendingPluginExecutionCommands);
 
+        // Kill all sessions and process plugin results where needed
         for (int i = 0; i < termuxSessions.size(); i++) {
-            ExecutionCommand executionCommand = termuxSessions.get(i).getExecutionCommand();
-            processResult = mWantsToStop || executionCommand.isPluginExecutionCommandWithPendingResult();
-            termuxSessions.get(i).killIfExecuting(this, processResult);
-            if (!processResult)
-                mShellManager.mTermuxSessions.remove(termuxSessions.get(i));
+            TermuxSession session = termuxSessions.get(i);
+            ExecutionCommand executionCommand = session.getExecutionCommand();
+            boolean processResult = mWantsToStop || executionCommand.isPluginExecutionCommandWithPendingResult();
+
+            // killIfExecuting sets state to FAILED and sends SIGKILL. When processResult is true,
+            // it also triggers processTermuxSessionResult → onTermuxSessionExited callback which
+            // tries to remove from the live mTermuxSessions list. That removal is harmless since
+            // we clear the entire list below, but we must NOT also remove individually in this loop
+            // (which was the original double-removal bug).
+            session.killIfExecuting(this, processResult);
         }
 
-
+        // Kill all tasks (including non-plugin) to avoid leaving orphan processes.
+        // Previously, non-plugin tasks were only removed from the list without being killed,
+        // which left the actual OS processes running with no way to track or stop them.
         for (int i = 0; i < termuxTasks.size(); i++) {
-            ExecutionCommand executionCommand = termuxTasks.get(i).getExecutionCommand();
-            if (executionCommand.isPluginExecutionCommandWithPendingResult())
-                termuxTasks.get(i).killIfExecuting(this, true);
-            else
-                mShellManager.mTermuxTasks.remove(termuxTasks.get(i));
+            AppShell task = termuxTasks.get(i);
+            ExecutionCommand executionCommand = task.getExecutionCommand();
+            boolean processResult = executionCommand.isPluginExecutionCommandWithPendingResult();
+
+            // Always kill, but only process results for plugin commands that expect them.
+            // killIfExecuting sets state to FAILED; when processResult is true it also triggers
+            // processAppShellResult → onAppShellExited (posted via mHandler, runs later).
+            task.killIfExecuting(this, processResult);
         }
 
+        // Process any pending plugin commands that never made it to sessions or tasks
         for (int i = 0; i < pendingPluginExecutionCommands.size(); i++) {
             ExecutionCommand executionCommand = pendingPluginExecutionCommands.get(i);
             if (!executionCommand.shouldNotProcessResults() && executionCommand.isPluginExecutionCommandWithPendingResult()) {
@@ -296,6 +310,20 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
                 }
             }
         }
+
+        // Clear all lists in one shot. This is safe because:
+        // 1. For sessions: onTermuxSessionExited callbacks triggered by killIfExecuting above
+        //    may have already removed some entries, but clearing handles whatever remains.
+        // 2. For tasks: onAppShellExited callbacks posted via mHandler.post() will run later
+        //    and try to remove already-cleared entries (harmless no-op due to remove-by-reference).
+        // 3. This ensures no stale entries remain regardless of callback timing.
+        mShellManager.mTermuxSessions.clear();
+        mShellManager.mTermuxTasks.clear();
+        mShellManager.mPendingPluginExecutionCommands.clear();
+
+        // Notify activity session list that everything has been cleared
+        if (mTermuxTerminalSessionActivityClient != null)
+            mTermuxTerminalSessionActivityClient.termuxSessionListNotifyUpdated();
     }
 
 
@@ -507,6 +535,18 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
     @Override
     public void onAppShellExited(final AppShell termuxTask) {
         mHandler.post(() -> {
+            // If the service is already shutting down via ACTION_STOP_SERVICE, killAllTermuxExecutionCommands
+            // has already handled cleanup (killing processes, processing plugin results, clearing lists).
+            // Deferred callbacks posted via mHandler.post() must not interfere with that cleanup:
+            // - Removing from an already-cleared list is a harmless no-op, but processing plugin results
+            //   again could send duplicate results back to the caller.
+            // - Calling updateNotification() after requestStopService() is unnecessary and could show
+            //   a stale notification briefly before the service is destroyed.
+            if (mWantsToStop) {
+                Logger.logVerbose(LOG_TAG, "Ignoring onAppShellExited callback since service is stopping");
+                return;
+            }
+
             if (termuxTask != null) {
                 ExecutionCommand executionCommand = termuxTask.getExecutionCommand();
 
@@ -638,6 +678,16 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
     /** Callback received when a {@link TermuxSession} finishes. */
     @Override
     public void onTermuxSessionExited(final TermuxSession termuxSession) {
+        // If the service is already shutting down via ACTION_STOP_SERVICE, killAllTermuxExecutionCommands
+        // has already handled cleanup (killing processes, processing plugin results, clearing lists).
+        // This callback may be triggered synchronously from killIfExecuting → processTermuxSessionResult,
+        // so we must skip redundant processing to avoid duplicate plugin result delivery and avoid
+        // interfering with the list clearing that happens at the end of killAllTermuxExecutionCommands.
+        if (mWantsToStop) {
+            Logger.logVerbose(LOG_TAG, "Ignoring onTermuxSessionExited callback since service is stopping");
+            return;
+        }
+
         if (termuxSession != null) {
             ExecutionCommand executionCommand = termuxSession.getExecutionCommand();
 
@@ -850,7 +900,15 @@ public final class TermuxService extends Service implements AppShell.AppShellCli
 
     /** Update the shown foreground service notification after making any changes that affect it. */
     private synchronized void updateNotification() {
-        if (mWakeLock == null && mShellManager.mTermuxSessions.isEmpty() && mShellManager.mTermuxTasks.isEmpty()) {
+        // Take consistent snapshots of counts within this synchronized block to avoid
+        // reading different states between the stop-decision check and the notification build.
+        // Without this, a concurrent session exit could make the stop check see "not empty"
+        // while buildNotification sees "empty", producing a brief "0 sessions" notification
+        // just before the service stops (or worse, failing to stop at all).
+        boolean hasSessions = !mShellManager.mTermuxSessions.isEmpty();
+        boolean hasTasks = !mShellManager.mTermuxTasks.isEmpty();
+
+        if (mWakeLock == null && !hasSessions && !hasTasks) {
             // Exit if we are updating after the user disabled all locks with no sessions or tasks running.
             requestStopService();
         } else {
