@@ -14,6 +14,8 @@ import com.termux.shared.logger.Logger;
 import com.termux.shared.markdown.MarkdownUtils;
 import com.termux.shared.data.DataUtils;
 import com.termux.shared.shell.command.runner.app.AppShell;
+import com.termux.shared.termux.TermuxConstants.TERMUX_APP.RUN_COMMAND_SERVICE;
+import com.termux.shared.termux.TermuxConstants.TERMUX_APP.TERMUX_SERVICE;
 import com.termux.terminal.TerminalSession;
 
 import java.util.Collections;
@@ -140,6 +142,74 @@ public class ExecutionCommand {
 
     }
 
+    /**
+     * Abstraction over intent extra key names so that the same parsing logic can be used
+     * for both {@link TERMUX_SERVICE} and {@link RUN_COMMAND_SERVICE} intents which use
+     * different key namespaces.
+     */
+    public interface ExecutionCommandIntentKeys {
+        String runner();
+        String background();
+        String backgroundCustomLogLevel();
+        String sessionAction();
+        String shellName();
+        String shellCreateMode();
+        String commandLabel();
+        String commandDescription();
+        String commandHelp();
+        /** May return {@code null} if the key namespace does not define this extra. */
+        @Nullable String pluginApiHelp();
+        String pendingIntent();
+        String resultDirectory();
+        String resultSingleFile();
+        String resultFileBasename();
+        String resultFileOutputFormat();
+        String resultFileErrorFormat();
+        String resultFilesSuffix();
+    }
+
+    /** {@link ExecutionCommandIntentKeys} for {@link TERMUX_SERVICE} intent extras. */
+    public static final ExecutionCommandIntentKeys TERMUX_SERVICE_KEYS = new ExecutionCommandIntentKeys() {
+        @Override public String runner() { return TERMUX_SERVICE.EXTRA_RUNNER; }
+        @Override public String background() { return TERMUX_SERVICE.EXTRA_BACKGROUND; }
+        @Override public String backgroundCustomLogLevel() { return TERMUX_SERVICE.EXTRA_BACKGROUND_CUSTOM_LOG_LEVEL; }
+        @Override public String sessionAction() { return TERMUX_SERVICE.EXTRA_SESSION_ACTION; }
+        @Override public String shellName() { return TERMUX_SERVICE.EXTRA_SHELL_NAME; }
+        @Override public String shellCreateMode() { return TERMUX_SERVICE.EXTRA_SHELL_CREATE_MODE; }
+        @Override public String commandLabel() { return TERMUX_SERVICE.EXTRA_COMMAND_LABEL; }
+        @Override public String commandDescription() { return TERMUX_SERVICE.EXTRA_COMMAND_DESCRIPTION; }
+        @Override public String commandHelp() { return TERMUX_SERVICE.EXTRA_COMMAND_HELP; }
+        @Override public String pluginApiHelp() { return TERMUX_SERVICE.EXTRA_PLUGIN_API_HELP; }
+        @Override public String pendingIntent() { return TERMUX_SERVICE.EXTRA_PENDING_INTENT; }
+        @Override public String resultDirectory() { return TERMUX_SERVICE.EXTRA_RESULT_DIRECTORY; }
+        @Override public String resultSingleFile() { return TERMUX_SERVICE.EXTRA_RESULT_SINGLE_FILE; }
+        @Override public String resultFileBasename() { return TERMUX_SERVICE.EXTRA_RESULT_FILE_BASENAME; }
+        @Override public String resultFileOutputFormat() { return TERMUX_SERVICE.EXTRA_RESULT_FILE_OUTPUT_FORMAT; }
+        @Override public String resultFileErrorFormat() { return TERMUX_SERVICE.EXTRA_RESULT_FILE_ERROR_FORMAT; }
+        @Override public String resultFilesSuffix() { return TERMUX_SERVICE.EXTRA_RESULT_FILES_SUFFIX; }
+    };
+
+    /** {@link ExecutionCommandIntentKeys} for {@link RUN_COMMAND_SERVICE} intent extras. */
+    public static final ExecutionCommandIntentKeys RUN_COMMAND_KEYS = new ExecutionCommandIntentKeys() {
+        @Override public String runner() { return RUN_COMMAND_SERVICE.EXTRA_RUNNER; }
+        @Override public String background() { return RUN_COMMAND_SERVICE.EXTRA_BACKGROUND; }
+        @Override public String backgroundCustomLogLevel() { return RUN_COMMAND_SERVICE.EXTRA_BACKGROUND_CUSTOM_LOG_LEVEL; }
+        @Override public String sessionAction() { return RUN_COMMAND_SERVICE.EXTRA_SESSION_ACTION; }
+        @Override public String shellName() { return RUN_COMMAND_SERVICE.EXTRA_SHELL_NAME; }
+        @Override public String shellCreateMode() { return RUN_COMMAND_SERVICE.EXTRA_SHELL_CREATE_MODE; }
+        @Override public String commandLabel() { return RUN_COMMAND_SERVICE.EXTRA_COMMAND_LABEL; }
+        @Override public String commandDescription() { return RUN_COMMAND_SERVICE.EXTRA_COMMAND_DESCRIPTION; }
+        @Override public String commandHelp() { return RUN_COMMAND_SERVICE.EXTRA_COMMAND_HELP; }
+        @Override public String pluginApiHelp() { return null; }
+        @Override public String pendingIntent() { return RUN_COMMAND_SERVICE.EXTRA_PENDING_INTENT; }
+        @Override public String resultDirectory() { return RUN_COMMAND_SERVICE.EXTRA_RESULT_DIRECTORY; }
+        @Override public String resultSingleFile() { return RUN_COMMAND_SERVICE.EXTRA_RESULT_SINGLE_FILE; }
+        @Override public String resultFileBasename() { return RUN_COMMAND_SERVICE.EXTRA_RESULT_FILE_BASENAME; }
+        @Override public String resultFileOutputFormat() { return RUN_COMMAND_SERVICE.EXTRA_RESULT_FILE_OUTPUT_FORMAT; }
+        @Override public String resultFileErrorFormat() { return RUN_COMMAND_SERVICE.EXTRA_RESULT_FILE_ERROR_FORMAT; }
+        @Override public String resultFilesSuffix() { return RUN_COMMAND_SERVICE.EXTRA_RESULT_FILES_SUFFIX; }
+    };
+
     /** The optional unique id for the {@link ExecutionCommand}. This should equal -1 if execution
      * command is not going to be managed by a shell manager. */
     public Integer id;
@@ -253,6 +323,63 @@ public class ExecutionCommand {
         this.workingDirectory = workingDirectory;
         this.runner = runner;
         this.isFailsafe = isFailsafe;
+    }
+
+
+    /**
+     * Parse common intent extras shared by both {@link TERMUX_SERVICE} and
+     * {@link RUN_COMMAND_SERVICE} intents into this {@link ExecutionCommand}.
+     *
+     * The {@link ExecutionCommandIntentKeys} abstraction allows the same parsing
+     * logic to work with different key namespaces.
+     *
+     * @param intent The {@link Intent} to parse.
+     * @param keys The {@link ExecutionCommandIntentKeys} implementation providing extra key names.
+     */
+    public void parseCommonExtras(@NonNull Intent intent, @NonNull ExecutionCommandIntentKeys keys) {
+        // Runner resolution: EXTRA_RUNNER → EXTRA_BACKGROUND fallback → TERMINAL_SESSION default
+        this.runner = IntentUtils.getStringExtraIfSet(intent, keys.runner(),
+            (intent.getBooleanExtra(keys.background(), false)
+                ? Runner.APP_SHELL.getName() : Runner.TERMINAL_SESSION.getName()));
+
+        this.backgroundCustomLogLevel = IntentUtils.getIntegerExtraIfSet(
+            intent, keys.backgroundCustomLogLevel(), null);
+        this.sessionAction = intent.getStringExtra(keys.sessionAction());
+        this.shellName = IntentUtils.getStringExtraIfSet(intent, keys.shellName(), null);
+        this.shellCreateMode = IntentUtils.getStringExtraIfSet(intent, keys.shellCreateMode(), null);
+        this.commandLabel = IntentUtils.getStringExtraIfSet(intent, keys.commandLabel(), null);
+        this.commandDescription = IntentUtils.getStringExtraIfSet(intent, keys.commandDescription(), null);
+        this.commandHelp = IntentUtils.getStringExtraIfSet(intent, keys.commandHelp(), null);
+
+        String pluginApiHelpKey = keys.pluginApiHelp();
+        if (pluginApiHelpKey != null)
+            this.pluginAPIHelp = IntentUtils.getStringExtraIfSet(intent, pluginApiHelpKey, null);
+
+        // Result config
+        this.resultConfig.resultPendingIntent = intent.getParcelableExtra(keys.pendingIntent());
+        this.resultConfig.resultDirectoryPath = IntentUtils.getStringExtraIfSet(
+            intent, keys.resultDirectory(), null);
+        if (this.resultConfig.resultDirectoryPath != null) {
+            this.resultConfig.resultSingleFile = intent.getBooleanExtra(keys.resultSingleFile(), false);
+            this.resultConfig.resultFileBasename = IntentUtils.getStringExtraIfSet(
+                intent, keys.resultFileBasename(), null);
+            this.resultConfig.resultFileOutputFormat = IntentUtils.getStringExtraIfSet(
+                intent, keys.resultFileOutputFormat(), null);
+            this.resultConfig.resultFileErrorFormat = IntentUtils.getStringExtraIfSet(
+                intent, keys.resultFileErrorFormat(), null);
+            this.resultConfig.resultFilesSuffix = IntentUtils.getStringExtraIfSet(
+                intent, keys.resultFilesSuffix(), null);
+        }
+    }
+
+    /**
+     * Resolve the {@link Runner} enum value for the current {@link #runner} string.
+     *
+     * @return Returns the {@link Runner} if the runner string is valid, otherwise {@code null}.
+     */
+    @Nullable
+    public Runner resolveRunner() {
+        return Runner.runnerOf(this.runner);
     }
 
 
