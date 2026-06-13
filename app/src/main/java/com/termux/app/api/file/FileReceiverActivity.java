@@ -86,8 +86,8 @@ public class FileReceiverActivity extends AppCompatActivity {
                 } else {
                     String subject = IntentUtils.getStringExtraIfSet(intent, Intent.EXTRA_SUBJECT, null);
                     if (subject == null) subject = sharedTitle;
-                    if (subject != null) subject += ".txt";
-                    promptNameAndSave(new ByteArrayInputStream(sharedText.getBytes(StandardCharsets.UTF_8)), subject);
+                    promptNameAndSave(new ByteArrayInputStream(sharedText.getBytes(StandardCharsets.UTF_8)),
+                        getDisplayNameForTextShare(subject));
                 }
             } else {
                 showErrorDialogAndQuit("Send action without content - nothing to save.");
@@ -211,8 +211,17 @@ public class FileReceiverActivity extends AppCompatActivity {
             return null;
         }
 
+        // Sanitize: strip path separators and unsafe characters
+        String sanitized = sanitizeFileName(attachmentFileName);
+        if (DataUtils.isNullOrEmpty(sanitized)) {
+            showErrorDialogAndQuit("File name is invalid after sanitization: \"" + attachmentFileName + "\"");
+            return null;
+        }
+
+        // Resolve name conflicts to avoid overwriting existing files
+        File outFile = getUniqueFileName(receiveDir, sanitized);
+
         try {
-            final File outFile = new File(receiveDir, attachmentFileName);
             try (FileOutputStream f = new FileOutputStream(outFile)) {
                 byte[] buffer = new byte[4096];
                 int readBytes;
@@ -247,6 +256,67 @@ public class FileReceiverActivity extends AppCompatActivity {
         executeIntent.putExtra(TERMUX_SERVICE.EXTRA_ARGUMENTS, new String[]{url});
         startService(executeIntent);
         finish();
+    }
+
+    /**
+     * Sanitize a file name by replacing path separators and characters that are unsafe in file names
+     * with underscores. This prevents directory traversal and ensures the name maps to a single file
+     * inside the target directory.
+     *
+     * @param fileName The raw file name to sanitize.
+     * @return The sanitized file name, or {@code null} if input is {@code null}.
+     */
+    static String sanitizeFileName(String fileName) {
+        if (fileName == null) return null;
+        // Replace path separators and other unsafe filename characters with underscore
+        return fileName.replaceAll("[/\\\\:*?\"<>|]", "_");
+    }
+
+    /**
+     * Generate a unique file name in the given directory to avoid overwriting existing files.
+     * If a file with the given name already exists, a counter is appended before the extension
+     * (e.g. {@code report.pdf} → {@code report (2).pdf} → {@code report (3).pdf}).
+     *
+     * @param dir      The target directory.
+     * @param fileName The desired file name (must be already sanitized).
+     * @return A {@link File} with a path that does not yet exist.
+     */
+    static File getUniqueFileName(File dir, String fileName) {
+        File file = new File(dir, fileName);
+        if (!file.exists()) return file;
+
+        String baseName;
+        String extension;
+        int lastDot = fileName.lastIndexOf('.');
+        if (lastDot > 0) {
+            baseName = fileName.substring(0, lastDot);
+            extension = fileName.substring(lastDot);
+        } else {
+            baseName = fileName;
+            extension = "";
+        }
+
+        int counter = 2;
+        while (file.exists()) {
+            file = new File(dir, baseName + " (" + counter + ")" + extension);
+            counter++;
+        }
+        return file;
+    }
+
+    /**
+     * Determine the default display name when shared text is saved as a file.
+     * If the subject/title already ends with {@code .txt}, it is used as-is to avoid a double
+     * extension. Otherwise {@code .txt} is appended. When the subject is {@code null} or empty,
+     * falls back to {@code "shared.txt"}.
+     *
+     * @param subject The {@code EXTRA_SUBJECT} or {@code EXTRA_TITLE} from the share intent.
+     * @return A suitable default file name.
+     */
+    static String getDisplayNameForTextShare(String subject) {
+        if (subject == null || subject.trim().isEmpty()) return "shared.txt";
+        if (subject.toLowerCase().endsWith(".txt")) return subject;
+        return subject + ".txt";
     }
 
     /**
