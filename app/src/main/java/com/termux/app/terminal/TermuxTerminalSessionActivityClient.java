@@ -35,6 +35,8 @@ import com.termux.terminal.TextStyle;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 
 /** The {@link TerminalSessionClient} implementation that may require an {@link Activity} for its interface methods. */
@@ -302,6 +304,12 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         // be stale, like current session not selected or scrolled to.
         checkAndScrollToSession(session);
         updateBackgroundColor();
+
+        // Persist the current session immediately so that creation, switching and removal all keep
+        // the stored session in sync with what is displayed. This ensures that when the activity is
+        // rebuilt (screen rotation, theme reload, shortcut/external launch) it restores the correct
+        // session instead of a stale one that was previously only written in onStop().
+        setCurrentStoredSession();
     }
 
     void notifyOfSessionChange() {
@@ -398,36 +406,19 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
 
     /** The current session as stored or the last one if that does not exist. */
     public TerminalSession getCurrentStoredSessionOrLast() {
-        TerminalSession stored = getCurrentStoredSession();
-
-        if (stored != null) {
-            // If a stored session is in the list of currently running sessions, then return it
-            return stored;
-        } else {
-            // Else return the last session currently running
-            TermuxService service = mActivity.getTermuxService();
-            if (service == null) return null;
-
-            TermuxSession termuxSession = service.getLastTermuxSession();
-            if (termuxSession != null)
-                return termuxSession.getTerminalSession();
-            else
-                return null;
-        }
-    }
-
-    private TerminalSession getCurrentStoredSession() {
-        String sessionHandle = mActivity.getPreferences().getCurrentSession();
-
-        // If no session is stored in shared preferences
-        if (sessionHandle == null)
-            return null;
-
-        // Check if the session handle found matches one of the currently running sessions
         TermuxService service = mActivity.getTermuxService();
         if (service == null) return null;
 
-        return service.getTerminalSessionForHandle(sessionHandle);
+        List<TermuxSession> termuxSessions = service.getTermuxSessions();
+        List<String> sessionHandles = new ArrayList<>();
+        for (int i = 0; i < termuxSessions.size(); i++)
+            sessionHandles.add(termuxSessions.get(i).getTerminalSession().mHandle);
+
+        String storedHandle = mActivity.getPreferences().getCurrentSession();
+        String handle = TermuxSessionRestorer.getSessionHandleToRestore(sessionHandles, storedHandle);
+        if (handle == null) return null;
+
+        return service.getTerminalSessionForHandle(handle);
     }
 
     public void removeFinishedSession(TerminalSession finishedSession) {
@@ -435,20 +426,32 @@ public class TermuxTerminalSessionActivityClient extends TermuxTerminalSessionCl
         TermuxService service = mActivity.getTermuxService();
         if (service == null) return;
 
-        int index = service.removeTermuxSession(finishedSession);
+        // Capture the currently selected session and a snapshot of the session order *before* the
+        // removal, so the correct session to switch to can be determined even if the list is mutated
+        // asynchronously by TermuxService.onTermuxSessionExited().
+        TerminalSession currentSession = mActivity.getCurrentSession();
+        String currentHandle = currentSession != null ? currentSession.mHandle : null;
+        List<TermuxSession> termuxSessions = service.getTermuxSessions();
+        List<String> handlesBeforeRemoval = new ArrayList<>();
+        for (int i = 0; i < termuxSessions.size(); i++)
+            handlesBeforeRemoval.add(termuxSessions.get(i).getTerminalSession().mHandle);
 
-        int size = service.getTermuxSessionsSize();
-        if (size == 0) {
+        service.removeTermuxSession(finishedSession);
+
+        String handle = TermuxSessionRestorer.getSessionHandleAfterRemoval(handlesBeforeRemoval,
+            finishedSession.mHandle, currentHandle);
+        if (handle == null) {
             // There are no sessions to show, so finish the activity.
             mActivity.finishActivityIfNotFinishing();
-        } else {
-            if (index >= size) {
-                index = size - 1;
-            }
-            TermuxSession termuxSession = service.getTermuxSession(index);
-            if (termuxSession != null)
-                setCurrentSession(termuxSession.getTerminalSession());
+            return;
         }
+
+        // Switching to the resolved session also refreshes the list highlight to its new position.
+        // When a non-current (e.g. background) session was auto-closed, this resolves back to the
+        // unchanged current session so the user is not yanked to a different one.
+        TerminalSession terminalSession = service.getTerminalSessionForHandle(handle);
+        if (terminalSession != null)
+            setCurrentSession(terminalSession);
     }
 
     public void termuxSessionListNotifyUpdated() {
